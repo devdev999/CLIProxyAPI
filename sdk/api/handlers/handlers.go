@@ -231,7 +231,11 @@ func updateSessionAffinity(meta map[string]any) {
 	}
 	sessionID, _ := meta[sessionAffinityMetadataKey].(string)
 	selectedAuthID, _ := meta[coreexecutor.SelectedAuthMetadataKey].(string)
-	if sessionID != "" && selectedAuthID != "" {
+	preferredAuthID, _ := meta[coreexecutor.PreferredAuthIDMetadataKey].(string)
+	// Only update when the selected auth differs from the preferred one.
+	// GetSessionAffinity already refreshed the TTL on the existing mapping,
+	// so re-writing the same value would just create a race window.
+	if sessionID != "" && selectedAuthID != "" && selectedAuthID != preferredAuthID {
 		cache.SetSessionAffinity(sessionID, selectedAuthID)
 	}
 }

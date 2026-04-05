@@ -18,7 +18,7 @@ Add session-aware sticky routing: requests sharing the same `X-Claude-Code-Sessi
 
 **File:** `internal/cache/session_affinity.go` (new, ~90 lines)
 
-A flat `sessionID → authID` cache following the same pattern as `signature_cache.go`:
+A flat `sessionID → Entry` cache (where Entry contains `authID` and `lastAccess` timestamp):
 
 - **Storage:** `sync.Map` — optimized for append-mostly, high-read-concurrency workloads.
 - **TTL:** `SessionAffinityTTL = 1 * time.Hour` (named constant), sliding expiration refreshed on every lookup hit.
@@ -71,9 +71,9 @@ Instead, after `Execute`/`ExecuteStream`/`ExecuteCount` returns successfully, th
 2. Look up `GetSessionAffinity(sessionID)` → `preferredAuthID`.
 3. Set `preferred_auth_id` in execution metadata (`opts.Metadata`).
 4. Execute normally — scheduler uses preferred if available, falls back if not.
-5. On success: read `selected_auth_id` from `opts.Metadata` → `SetSessionAffinity(sessionID, selectedAuthID)`.
-   - If `selectedAuthID == preferredAuthID`: cache refreshed (sliding TTL).
-   - If `selectedAuthID != preferredAuthID`: re-pinned to new credential.
+5. On success: read `selected_auth_id` from `opts.Metadata` → `SetSessionAffinity(sessionID, selectedAuthID)`:
+   - If `selectedAuthID != preferredAuthID`: re-pinned to new credential (updates mapping and TTL).
+   - If `selectedAuthID == preferredAuthID`: no action needed (TTL already refreshed by `GetSessionAffinity`).
 
 #### Covered execution paths:
 - `ExecuteWithAuthManager` — non-streaming Claude messages.

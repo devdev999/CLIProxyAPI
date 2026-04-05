@@ -71,8 +71,10 @@ func GetSessionAffinity(sessionID string) string {
 		return ""
 	}
 	// Refresh TTL on access (sliding expiration).
-	entry.Timestamp = now
-	sessionAffinityCache.Store(sessionID, entry)
+	// Use CompareAndSwap so a concurrent SetSessionAffinity that re-pinned
+	// to a different authID is not clobbered by this stale read.
+	refreshed := affinityEntry{AuthID: entry.AuthID, Timestamp: now}
+	sessionAffinityCache.CompareAndSwap(sessionID, entry, refreshed)
 	return entry.AuthID
 }
 

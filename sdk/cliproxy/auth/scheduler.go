@@ -204,6 +204,15 @@ func (s *authScheduler) pickSingle(ctx context.Context, provider, model string, 
 		}
 		return true
 	}
+	// Pass 1: try preferred auth (soft preference, falls back if unavailable).
+	if pinnedAuthID == "" {
+		if preferredAuthID := preferredAuthIDFromMetadata(opts.Metadata); preferredAuthID != "" {
+			if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, preferredPredicate(preferredAuthID, tried)); picked != nil {
+				return picked, nil
+			}
+		}
+	}
+	// Pass 2: normal selection (round-robin / fill-first).
 	if picked := shard.pickReadyLocked(preferWebsocket, s.strategy, predicate); picked != nil {
 		return picked, nil
 	}
@@ -263,6 +272,18 @@ func (s *authScheduler) pickMixed(ctx context.Context, providers []string, model
 		return nil, "", shard.unavailableErrorLocked("mixed", model, predicate)
 	}
 
+	// Pass 1: try preferred auth (soft preference, falls back if unavailable).
+	if preferredAuthID := preferredAuthIDFromMetadata(opts.Metadata); preferredAuthID != "" {
+		if providerKey := s.authProviders[preferredAuthID]; providerKey != "" && containsProvider(normalized, providerKey) {
+			if providerState := s.providers[providerKey]; providerState != nil {
+				shard := providerState.ensureModelLocked(modelKey, time.Now())
+				if picked := shard.pickReadyLocked(false, s.strategy, preferredPredicate(preferredAuthID, tried)); picked != nil {
+					return picked, providerKey, nil
+				}
+			}
+		}
+	}
+	// Pass 2: normal selection (weighted round-robin / fill-first).
 	predicate := triedPredicate(tried)
 	candidateShards := make([]*modelScheduler, len(normalized))
 	bestPriority := 0
@@ -407,6 +428,21 @@ func triedPredicate(tried map[string]struct{}) func(*scheduledAuth) bool {
 		}
 		_, ok := tried[entry.auth.ID]
 		return !ok
+	}
+}
+
+// preferredPredicate builds a filter that matches only the preferred auth, excluding already-tried auths.
+func preferredPredicate(preferredAuthID string, tried map[string]struct{}) func(*scheduledAuth) bool {
+	return func(entry *scheduledAuth) bool {
+		if entry == nil || entry.auth == nil || entry.auth.ID != preferredAuthID {
+			return false
+		}
+		if len(tried) > 0 {
+			if _, ok := tried[entry.auth.ID]; ok {
+				return false
+			}
+		}
+		return true
 	}
 }
 

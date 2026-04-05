@@ -1425,11 +1425,11 @@ func hasRequestedModelMetadata(meta map[string]any) bool {
 	}
 }
 
-func pinnedAuthIDFromMetadata(meta map[string]any) string {
+func stringFromMetadata(meta map[string]any, key string) string {
 	if len(meta) == 0 {
 		return ""
 	}
-	raw, ok := meta[cliproxyexecutor.PinnedAuthMetadataKey]
+	raw, ok := meta[key]
 	if !ok || raw == nil {
 		return ""
 	}
@@ -1441,6 +1441,14 @@ func pinnedAuthIDFromMetadata(meta map[string]any) string {
 	default:
 		return ""
 	}
+}
+
+func pinnedAuthIDFromMetadata(meta map[string]any) string {
+	return stringFromMetadata(meta, cliproxyexecutor.PinnedAuthMetadataKey)
+}
+
+func preferredAuthIDFromMetadata(meta map[string]any) string {
+	return stringFromMetadata(meta, cliproxyexecutor.PreferredAuthIDMetadataKey)
 }
 
 func publishSelectedAuthMetadata(meta map[string]any, authID string) {
@@ -2383,6 +2391,7 @@ func (m *Manager) routeAwareSelectionRequired(auth *Auth, routeModel string) boo
 
 func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	preferredAuthID := preferredAuthIDFromMetadata(opts.Metadata)
 
 	m.mu.RLock()
 	executor, okExecutor := m.executors[provider]
@@ -2424,6 +2433,25 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		m.mu.RUnlock()
 		return nil, nil, errAvailable
 	}
+	// Pass 1: try preferred auth among available candidates.
+	if pinnedAuthID == "" && preferredAuthID != "" {
+		for _, candidate := range available {
+			if candidate != nil && candidate.ID == preferredAuthID {
+				authCopy := candidate.Clone()
+				m.mu.RUnlock()
+				if !candidate.indexAssigned {
+					m.mu.Lock()
+					if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+						current.EnsureIndex()
+						authCopy = current.Clone()
+					}
+					m.mu.Unlock()
+				}
+				return authCopy, executor, nil
+			}
+		}
+	}
+	// Pass 2: normal selection.
 	selected, errPick := m.selector.Pick(ctx, provider, selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()
@@ -2495,6 +2523,7 @@ func (m *Manager) pickNext(ctx context.Context, provider, model string, opts cli
 
 func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, model string, opts cliproxyexecutor.Options, tried map[string]struct{}) (*Auth, ProviderExecutor, string, error) {
 	pinnedAuthID := pinnedAuthIDFromMetadata(opts.Metadata)
+	preferredAuthID := preferredAuthIDFromMetadata(opts.Metadata)
 
 	providerSet := make(map[string]struct{}, len(providers))
 	for _, provider := range providers {
@@ -2553,6 +2582,30 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 		m.mu.RUnlock()
 		return nil, nil, "", errAvailable
 	}
+	// Pass 1: try preferred auth among available candidates.
+	if pinnedAuthID == "" && preferredAuthID != "" {
+		for _, candidate := range available {
+			if candidate != nil && candidate.ID == preferredAuthID {
+				providerKey := strings.TrimSpace(strings.ToLower(candidate.Provider))
+				executor, okExecutor := m.executors[providerKey]
+				if !okExecutor {
+					break
+				}
+				authCopy := candidate.Clone()
+				m.mu.RUnlock()
+				if !candidate.indexAssigned {
+					m.mu.Lock()
+					if current := m.auths[authCopy.ID]; current != nil && !current.indexAssigned {
+						current.EnsureIndex()
+						authCopy = current.Clone()
+					}
+					m.mu.Unlock()
+				}
+				return authCopy, executor, providerKey, nil
+			}
+		}
+	}
+	// Pass 2: normal selection.
 	selected, errPick := m.selector.Pick(ctx, "mixed", selectionArgForSelector(m.selector, model), opts, available)
 	if errPick != nil {
 		m.mu.RUnlock()

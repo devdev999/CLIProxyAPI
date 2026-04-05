@@ -13,6 +13,10 @@ const SessionAffinityTTL = 1 * time.Hour
 // to bound memory usage from caller-controlled session IDs.
 const maxAffinityEntries = 10000
 
+// maxSessionIDLength caps the accepted session ID length to prevent
+// memory abuse via oversized caller-controlled header values.
+const maxSessionIDLength = 256
+
 // affinityEntry holds a cached session-to-auth mapping with timestamp.
 type affinityEntry struct {
 	AuthID    string
@@ -30,7 +34,7 @@ var affinityCleanupOnce sync.Once
 
 // SetSessionAffinity stores or updates the auth ID for a given session.
 func SetSessionAffinity(sessionID, authID string) {
-	if sessionID == "" || authID == "" {
+	if sessionID == "" || authID == "" || len(sessionID) > maxSessionIDLength {
 		return
 	}
 	affinityCleanupOnce.Do(startAffinityCleanup)
@@ -53,7 +57,7 @@ func SetSessionAffinity(sessionID, authID string) {
 // GetSessionAffinity retrieves the cached auth ID for a given session.
 // Returns empty string if not found or expired. Refreshes TTL on hit (sliding expiration).
 func GetSessionAffinity(sessionID string) string {
-	if sessionID == "" {
+	if sessionID == "" || len(sessionID) > maxSessionIDLength {
 		return ""
 	}
 	raw, ok := sessionAffinityCache.Load(sessionID)
@@ -80,7 +84,7 @@ func GetSessionAffinity(sessionID string) string {
 
 // ClearSessionAffinity removes the affinity mapping for a given session.
 func ClearSessionAffinity(sessionID string) {
-	if sessionID == "" {
+	if sessionID == "" || len(sessionID) > maxSessionIDLength {
 		return
 	}
 	if _, loaded := sessionAffinityCache.LoadAndDelete(sessionID); loaded {

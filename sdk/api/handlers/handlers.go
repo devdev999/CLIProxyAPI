@@ -14,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/tidwall/gjson"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
@@ -189,6 +190,17 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 // sessionAffinityMetadataKey stores the client session ID in metadata for post-success affinity update.
 const sessionAffinityMetadataKey = "session_affinity_id"
 
+// CodexSessionIDFromHeaders extracts a Codex CLI session ID from request headers.
+// It checks X-Codex-Turn-Metadata (JSON with session_id field) then Session_id as a fallback.
+func CodexSessionIDFromHeaders(headers http.Header) string {
+	if raw := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); raw != "" {
+		if sid := strings.TrimSpace(gjson.Get(raw, "session_id").String()); sid != "" {
+			return sid
+		}
+	}
+	return strings.TrimSpace(headers.Get("Session_id"))
+}
+
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
 	// It is forwarded as execution metadata; when absent we generate a UUID.
@@ -198,6 +210,10 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
 			sessionID = strings.TrimSpace(ginCtx.GetHeader("X-Claude-Code-Session-Id"))
+			// Codex CLI doesn't send X-Claude-Code-Session-Id; fall back to its native headers.
+			if sessionID == "" {
+				sessionID = CodexSessionIDFromHeaders(ginCtx.Request.Header)
+			}
 		}
 	}
 	if key == "" {

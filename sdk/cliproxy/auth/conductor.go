@@ -64,8 +64,13 @@ const (
 	refreshMaxConcurrency = 16
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 5 * time.Minute
-	quotaBackoffBase      = time.Second
-	quotaBackoffMax       = 30 * time.Minute
+	// refreshIneffectiveBackoff throttles refresh attempts when an executor returns
+	// success but the auth still evaluates as needing refresh (e.g. token expiry
+	// wasn't updated). Without this guard, the auto-refresh loop can tight-loop and
+	// burn CPU at idle.
+	refreshIneffectiveBackoff = 30 * time.Second
+	quotaBackoffBase          = time.Second
+	quotaBackoffMax           = 30 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -103,6 +108,13 @@ type Result struct {
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
+}
+
+// StoppableSelector is an optional interface for selectors that hold resources.
+// Selectors that implement this interface will have Stop called during shutdown.
+type StoppableSelector interface {
+	Selector
+	Stop()
 }
 
 // Hook captures lifecycle callbacks for observing auth changes.
@@ -2981,6 +2993,7 @@ func (m *Manager) StartAutoRefresh(parent context.Context, interval time.Duratio
 }
 
 // StopAutoRefresh cancels the background refresh loop, if running.
+// It also stops the selector if it implements StoppableSelector.
 func (m *Manager) StopAutoRefresh() {
 	m.mu.Lock()
 	cancel := m.refreshCancel
@@ -2989,6 +3002,10 @@ func (m *Manager) StopAutoRefresh() {
 	m.mu.Unlock()
 	if cancel != nil {
 		cancel()
+	}
+	// Stop selector if it implements StoppableSelector (e.g., SessionAffinitySelector)
+	if stoppable, ok := m.selector.(StoppableSelector); ok {
+		stoppable.Stop()
 	}
 }
 
@@ -3281,6 +3298,9 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
+	if m.shouldRefresh(updated, now) {
+		updated.NextRefreshAfter = now.Add(refreshIneffectiveBackoff)
+	}
 	_, _ = m.Update(ctx, updated)
 }
 

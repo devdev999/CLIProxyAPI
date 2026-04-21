@@ -14,9 +14,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
-	"github.com/tidwall/gjson"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/cache"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
@@ -188,40 +185,20 @@ func PassthroughHeadersEnabled(cfg *config.SDKConfig) bool {
 	return cfg != nil && cfg.PassthroughHeaders
 }
 
-// sessionAffinityMetadataKey stores the client session ID in metadata for post-success affinity update.
-const sessionAffinityMetadataKey = "session_affinity_id"
-
-// CodexSessionIDFromHeaders extracts a Codex CLI session ID from request headers.
-// It checks X-Codex-Turn-Metadata (JSON with session_id field) then Session_id as a fallback.
-func CodexSessionIDFromHeaders(headers http.Header) string {
-	if raw := strings.TrimSpace(headers.Get("X-Codex-Turn-Metadata")); raw != "" {
-		if sid := strings.TrimSpace(gjson.Get(raw, "session_id").String()); sid != "" {
-			return sid
-		}
-	}
-	return strings.TrimSpace(headers.Get("Session_id"))
-}
-
 func requestExecutionMetadata(ctx context.Context) map[string]any {
 	// Idempotency-Key is an optional client-supplied header used to correlate retries.
-	// It is forwarded as execution metadata; when absent we generate a UUID.
+	// Only include it if the client explicitly provides it.
 	key := ""
-	var sessionID string
 	if ctx != nil {
 		if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 			key = strings.TrimSpace(ginCtx.GetHeader("Idempotency-Key"))
-			sessionID = strings.TrimSpace(ginCtx.GetHeader("X-Claude-Code-Session-Id"))
-			// Codex CLI doesn't send X-Claude-Code-Session-Id; fall back to its native headers.
-			if sessionID == "" {
-				sessionID = CodexSessionIDFromHeaders(ginCtx.Request.Header)
-			}
 		}
 	}
-	if key == "" {
-		key = uuid.NewString()
-	}
 
-	meta := map[string]any{idempotencyKeyMetadataKey: key}
+	meta := make(map[string]any)
+	if key != "" {
+		meta[idempotencyKeyMetadataKey] = key
+	}
 	if pinnedAuthID := pinnedAuthIDFromContext(ctx); pinnedAuthID != "" {
 		meta[coreexecutor.PinnedAuthMetadataKey] = pinnedAuthID
 	}
@@ -231,30 +208,7 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	if executionSessionID := executionSessionIDFromContext(ctx); executionSessionID != "" {
 		meta[coreexecutor.ExecutionSessionMetadataKey] = executionSessionID
 	}
-	// Session affinity: look up preferred auth for this session.
-	if sessionID != "" {
-		meta[sessionAffinityMetadataKey] = sessionID
-		if preferredAuthID := cache.GetSessionAffinity(sessionID); preferredAuthID != "" {
-			meta[coreexecutor.PreferredAuthIDMetadataKey] = preferredAuthID
-		}
-	}
 	return meta
-}
-
-// updateSessionAffinity writes the session-to-auth mapping after a successful execution.
-func updateSessionAffinity(meta map[string]any) {
-	if len(meta) == 0 {
-		return
-	}
-	sessionID, _ := meta[sessionAffinityMetadataKey].(string)
-	selectedAuthID, _ := meta[coreexecutor.SelectedAuthMetadataKey].(string)
-	preferredAuthID, _ := meta[coreexecutor.PreferredAuthIDMetadataKey].(string)
-	// Only update when the selected auth differs from the preferred one.
-	// GetSessionAffinity already refreshed the TTL on the existing mapping,
-	// so re-writing the same value would just create a race window.
-	if sessionID != "" && selectedAuthID != "" && selectedAuthID != preferredAuthID {
-		cache.SetSessionAffinity(sessionID, selectedAuthID)
-	}
 }
 
 func pinnedAuthIDFromContext(ctx context.Context) string {
@@ -553,7 +507,6 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		}
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	updateSessionAffinity(opts.Metadata)
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
 	}
@@ -601,7 +554,6 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		}
 		return nil, nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	updateSessionAffinity(opts.Metadata)
 	if !PassthroughHeadersEnabled(h.Cfg) {
 		return resp.Payload, nil, nil
 	}
@@ -740,7 +692,6 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					if !sentPayload {
 						if bootstrapRetries < maxBootstrapRetries && bootstrapEligible(streamErr) {
 							bootstrapRetries++
-							delete(opts.Metadata, coreexecutor.PreferredAuthIDMetadataKey)
 							retryResult, retryErr := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
 							if retryErr == nil {
 								if passthroughHeadersEnabled {
@@ -775,10 +726,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 							return
 						}
 					}
-					if !sentPayload {
-						sentPayload = true
-						updateSessionAffinity(opts.Metadata)
-					}
+					sentPayload = true
 					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
 						return
 					}

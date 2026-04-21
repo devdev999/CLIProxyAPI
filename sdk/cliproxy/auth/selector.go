@@ -2,6 +2,8 @@ package auth
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash/fnv"
@@ -471,9 +473,10 @@ func NewSessionAffinitySelectorWithConfig(cfg SessionAffinityConfig) *SessionAff
 // Priority for session ID extraction:
 //  1. metadata.user_id (Claude Code format) - highest priority
 //  2. X-Session-ID header
-//  3. metadata.user_id (non-Claude Code format)
-//  4. conversation_id field
-//  5. Hash-based fallback from messages
+//  3. Derived from client auth credentials + identity headers (proxy-friendly)
+//  4. metadata.user_id (non-Claude Code format)
+//  5. conversation_id field
+//  6. Hash-based fallback from messages
 //
 // Note: The cache key includes provider, session ID, and model to handle cases where
 // a session uses multiple models (e.g., gemini-2.5-pro and gemini-3-flash-preview)
@@ -570,9 +573,10 @@ func (s *SessionAffinitySelector) InvalidateAuth(authID string) {
 // Priority order:
 //  1. metadata.user_id (Claude Code format with _session_{uuid}) - highest priority for Claude Code clients
 //  2. X-Session-ID header
-//  3. metadata.user_id (non-Claude Code format)
-//  4. conversation_id field in request body
-//  5. Stable hash from first few messages content (fallback)
+//  3. Derived from client auth credentials + identity headers (proxy-friendly)
+//  4. metadata.user_id (non-Claude Code format)
+//  5. conversation_id field in request body
+//  6. Stable hash from first few messages content (fallback)
 func ExtractSessionID(headers http.Header, payload []byte, metadata map[string]any) string {
 	primary, _ := extractSessionIDs(headers, payload, metadata)
 	return primary
@@ -608,23 +612,70 @@ func extractSessionIDs(headers http.Header, payload []byte, metadata map[string]
 		}
 	}
 
+	// 3. Derived session from client identity headers (proxy-friendly fallback).
+	// When clients connect through proxies like LiteLLM that strip session headers
+	// and rewrite request metadata, derive a stable session ID from the client's
+	// auth credentials and identity headers that survive proxy translation.
+	if headers != nil {
+		if derived := deriveSessionFromHeaders(headers); derived != "" {
+			return derived, ""
+		}
+	}
+
 	if len(payload) == 0 {
 		return "", ""
 	}
 
-	// 3. metadata.user_id (non-Claude Code format)
+	// 4. metadata.user_id (non-Claude Code format)
 	userID := gjson.GetBytes(payload, "metadata.user_id").String()
 	if userID != "" {
 		return "user:" + userID, ""
 	}
 
-	// 4. conversation_id field
+	// 5. conversation_id field
 	if convID := gjson.GetBytes(payload, "conversation_id").String(); convID != "" {
 		return "conv:" + convID, ""
 	}
 
-	// 5. Hash-based fallback from message content
+	// 6. Hash-based fallback from message content
 	return extractMessageHashIDs(payload)
+}
+
+// deriveSessionFromHeaders builds a stable session identifier from client request
+// headers when no explicit session header or metadata is present. The derived ID is
+// a truncated SHA-256 of the client's auth credential and optional user identity,
+// giving per-client sticky routing that works through proxy layers (e.g. LiteLLM)
+// that strip upstream session headers and rewrite request metadata.
+func deriveSessionFromHeaders(headers http.Header) string {
+	auth := strings.TrimSpace(headers.Get("Authorization"))
+	if auth == "" {
+		auth = strings.TrimSpace(headers.Get("X-Api-Key"))
+	}
+	if auth == "" {
+		return ""
+	}
+	h := sha256.New()
+	h.Write([]byte(auth))
+	// Include forwarded client IP when available for multi-user differentiation
+	// behind the same proxy credential.
+	for _, ipHeader := range []string{"X-Forwarded-For", "X-Real-IP"} {
+		if ip := strings.TrimSpace(headers.Get(ipHeader)); ip != "" {
+			// X-Forwarded-For may contain a chain; use only the leftmost (original client).
+			if comma := strings.IndexByte(ip, ','); comma > 0 {
+				ip = strings.TrimSpace(ip[:comma])
+			}
+			h.Write([]byte(ip))
+			break
+		}
+	}
+	// Include per-user identity when available (LiteLLM, OpenAI-compatible proxies).
+	for _, userHeader := range []string{"X-LiteLLM-User", "X-User-Id", "X-User"} {
+		if user := strings.TrimSpace(headers.Get(userHeader)); user != "" {
+			h.Write([]byte(user))
+			break
+		}
+	}
+	return "derived:" + hex.EncodeToString(h.Sum(nil))[:16]
 }
 
 func extractMessageHashIDs(payload []byte) (primaryID, fallbackID string) {

@@ -7,7 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/sdk/api/handlers"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -140,11 +139,18 @@ func websocketDownstreamSessionKey(req *http.Request) string {
 	if req == nil {
 		return ""
 	}
-	// X-Client-Request-Id is per-request, but sufficient for websocket session keying.
 	if requestID := strings.TrimSpace(req.Header.Get("X-Client-Request-Id")); requestID != "" {
 		return requestID
 	}
-	return handlers.CodexSessionIDFromHeaders(req.Header)
+	if raw := strings.TrimSpace(req.Header.Get("X-Codex-Turn-Metadata")); raw != "" {
+		if sessionID := strings.TrimSpace(gjson.Get(raw, "session_id").String()); sessionID != "" {
+			return sessionID
+		}
+	}
+	if sessionID := strings.TrimSpace(req.Header.Get("Session_id")); sessionID != "" {
+		return sessionID
+	}
+	return ""
 }
 
 type websocketToolSessionRefCounter struct {

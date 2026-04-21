@@ -211,6 +211,37 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return meta
 }
 
+// sessionRoutingHeaders are the specific headers the auth selector reads for
+// session affinity extraction. We copy only these instead of cloning the full
+// header map to avoid unnecessary allocations on every request.
+var sessionRoutingHeaders = []string{
+	"X-Session-ID",
+	"Authorization", "X-Api-Key",
+	"X-Forwarded-For", "X-Real-IP",
+	"X-LiteLLM-User", "X-User-Id", "X-User",
+}
+
+// requestHeaders extracts session-relevant inbound HTTP headers from the gin context.
+// These are forwarded via Options.Headers so the auth selector layer can inspect
+// client-supplied session and identity headers for sticky routing.
+func requestHeaders(ctx context.Context) http.Header {
+	if ctx == nil {
+		return nil
+	}
+	ginCtx, ok := ctx.Value("gin").(*gin.Context)
+	if !ok || ginCtx == nil || ginCtx.Request == nil {
+		return nil
+	}
+	src := ginCtx.Request.Header
+	dst := make(http.Header, len(sessionRoutingHeaders))
+	for _, key := range sessionRoutingHeaders {
+		if val := src.Get(key); val != "" {
+			dst.Set(key, val)
+		}
+	}
+	return dst
+}
+
 func pinnedAuthIDFromContext(ctx context.Context) string {
 	if ctx == nil {
 		return ""
@@ -488,6 +519,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         requestHeaders(ctx),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.Execute(ctx, providers, req, opts)
@@ -535,6 +567,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         requestHeaders(ctx),
 	}
 	opts.Metadata = reqMeta
 	resp, err := h.AuthManager.ExecuteCount(ctx, providers, req, opts)
@@ -586,6 +619,7 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		Alt:             alt,
 		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
+		Headers:         requestHeaders(ctx),
 	}
 	opts.Metadata = reqMeta
 	streamResult, err := h.AuthManager.ExecuteStream(ctx, providers, req, opts)
